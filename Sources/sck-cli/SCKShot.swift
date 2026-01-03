@@ -45,6 +45,8 @@ struct AudioInfo: Codable {
     let sampleRate: Int
     let channels: Int
     let filename: String
+    let microphoneUID: String?
+    let microphoneName: String?
 }
 
 /// Audio track metadata
@@ -131,6 +133,9 @@ struct SCKShot: AsyncParsableCommand {
 
         let captureDuration = length
 
+        // Load config (creates with defaults if missing)
+        let config = Config.loadOrCreateDefault()
+
         // Discover all displays
         guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
               !content.displays.isEmpty else {
@@ -173,8 +178,64 @@ struct SCKShot: AsyncParsableCommand {
             Darwin.exit(1)
         }
 
+        // Build list of windows to exclude via SCContentFilter
+        var windowsToExclude: [SCWindow] = []
+
+        // 1. Add windows from config-excluded apps (by bundle ID)
+        let excludedBundleIDs = Set(config.excludedApps.map { $0.bundleID })
+        let excludedAppWindows = content.windows.filter { window in
+            guard let bundleID = window.owningApplication?.bundleIdentifier else { return false }
+            return excludedBundleIDs.contains(bundleID)
+        }
+        windowsToExclude.append(contentsOf: excludedAppWindows)
+
+        // 2. Add private/incognito browser windows (if enabled)
+        if config.excludePrivateBrowsing {
+            let privatePatterns: [(bundleID: String, patterns: [String])] = [
+                ("com.apple.Safari", ["(Private)", "Private Browsing"]),
+                ("com.google.Chrome", ["(Incognito)"]),
+                ("org.mozilla.firefox", ["(Private Browsing)", "Private Browsing"])
+            ]
+
+            for (bundleID, patterns) in privatePatterns {
+                let privateWindows = content.windows.filter { window in
+                    guard window.owningApplication?.bundleIdentifier == bundleID,
+                          let title = window.title else { return false }
+                    return patterns.contains { title.contains($0) }
+                }
+                windowsToExclude.append(contentsOf: privateWindows)
+            }
+        }
+
+        // Log exclusions
+        if !excludedAppWindows.isEmpty {
+            let appNames = Set(excludedAppWindows.compactMap { $0.owningApplication?.applicationName })
+            Stderr.print("[INFO] Excluding apps: \(appNames.sorted().joined(separator: ", "))")
+        }
+        let privateCount = windowsToExclude.count - excludedAppWindows.count
+        if privateCount > 0 {
+            Stderr.print("[INFO] Excluding \(privateCount) private/incognito window(s)")
+        }
+
+        // Select microphone based on priority config
+        var selectedMic: AudioInputDevice? = nil
+        if audio {
+            let availableMics = MicrophoneMonitor.listInputDevices()
+
+            if let bestMic = config.selectBestMicrophone(from: availableMics) {
+                selectedMic = bestMic
+                Stderr.print("[INFO] Using microphone: \(bestMic.name) (priority)")
+            } else if let defaultID = MicrophoneMonitor.getDefaultInputDeviceID(),
+                      let defaultMic = availableMics.first(where: { $0.id == defaultID }) {
+                selectedMic = defaultMic
+                Stderr.print("[INFO] Using microphone: \(defaultMic.name) (system default)")
+            } else {
+                Stderr.print("[INFO] No microphone available - capturing system audio only")
+            }
+        }
+
         // Output JSONL metadata to stdout
-        outputJSONL(displays: displays, videoPaths: videoPaths, audioPath: audio ? audioPath : nil, frameRate: frameRate)
+        outputJSONL(displays: displays, videoPaths: videoPaths, audioPath: audio ? audioPath : nil, frameRate: frameRate, selectedMic: selectedMic)
 
         // Shared abort semaphore - any stream error or signal triggers abort
         let abortSemaphore = DispatchSemaphore(value: 0)
@@ -223,8 +284,8 @@ struct SCKShot: AsyncParsableCommand {
                 Darwin.exit(1)
             }
 
-            // Configure stream for this display
-            let filter = SCContentFilter(display: display, excludingWindows: [])
+            // Configure stream for this display with window exclusions
+            let filter = SCContentFilter(display: display, excludingWindows: windowsToExclude)
             let cfg = SCStreamConfiguration()
             cfg.width = display.width
             cfg.height = display.height
@@ -240,8 +301,8 @@ struct SCKShot: AsyncParsableCommand {
             let captureAudioOnThisStream = audio && index == 0
             cfg.capturesAudio = captureAudioOnThisStream
             if #available(macOS 15.0, *), captureAudioOnThisStream {
-                cfg.captureMicrophone = true
-                cfg.microphoneCaptureDeviceID = nil
+                cfg.captureMicrophone = selectedMic != nil
+                cfg.microphoneCaptureDeviceID = selectedMic?.uid
             }
 
             let delegate = StreamDelegate(verbose: verbose, displayID: display.displayID, abortSemaphore: abortSemaphore)
@@ -418,7 +479,7 @@ struct SCKShot: AsyncParsableCommand {
     }
 
     /// Outputs JSONL to stdout for each display and audio source
-    private func outputJSONL(displays: [SCDisplay], videoPaths: [CGDirectDisplayID: String], audioPath: String?, frameRate: Double) {
+    private func outputJSONL(displays: [SCDisplay], videoPaths: [CGDirectDisplayID: String], audioPath: String?, frameRate: Double, selectedMic: AudioInputDevice?) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
 
@@ -443,7 +504,7 @@ struct SCKShot: AsyncParsableCommand {
         // Output audio info if enabled
         if let audioPath = audioPath {
             var tracks = [AudioTrackInfo(name: "system")]
-            if #available(macOS 15.0, *) {
+            if #available(macOS 15.0, *), selectedMic != nil {
                 tracks.append(AudioTrackInfo(name: "microphone"))
             }
             let info = AudioInfo(
@@ -451,7 +512,9 @@ struct SCKShot: AsyncParsableCommand {
                 tracks: tracks,
                 sampleRate: 48000,
                 channels: 1,
-                filename: audioPath
+                filename: audioPath,
+                microphoneUID: selectedMic?.uid,
+                microphoneName: selectedMic?.name
             )
             if let data = try? encoder.encode(info), let json = String(data: data, encoding: .utf8) {
                 Stdout.print(json)
