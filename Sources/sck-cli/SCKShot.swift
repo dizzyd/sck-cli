@@ -5,6 +5,12 @@ import Darwin
 import Dispatch
 import CoreMedia
 import CoreGraphics
+import Cocoa
+import ApplicationServices
+
+// Private API to get window ID from AXUIElement
+@_silgen_name("_AXUIElementGetWindow")
+func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 // Global state for signal handling (must be accessible from C signal handler)
 // These are intentionally global mutable state for async-signal-safe access
@@ -24,6 +30,41 @@ private func signalHandler(signal: Int32) {
         Stderr.print("\n[INFO] Received signal \(signal), shutting down gracefully (send again to force quit)...")
         globalAbortSemaphore?.signal()
     }
+}
+
+/// Returns window IDs of Safari private browsing windows using Accessibility API
+/// Safari's private windows have ", Private Browsing" appended to their title in AXUIElement
+/// but not in SCShareableContent or CGWindowList APIs
+private func getSafariPrivateWindowIDs() -> Set<CGWindowID> {
+    var privateWindowIDs = Set<CGWindowID>()
+
+    let runningApps = NSWorkspace.shared.runningApplications
+    guard let safari = runningApps.first(where: { $0.bundleIdentifier == "com.apple.Safari" }) else {
+        return privateWindowIDs
+    }
+
+    let appElement = AXUIElementCreateApplication(safari.processIdentifier)
+
+    var windowsValue: CFTypeRef?
+    guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue) == .success,
+          let windows = windowsValue as? [AXUIElement] else {
+        return privateWindowIDs
+    }
+
+    for window in windows {
+        var titleValue: CFTypeRef?
+        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &titleValue)
+
+        if let title = titleValue as? String, title.hasSuffix(", Private Browsing") {
+            var windowID: CGWindowID = 0
+            _ = _AXUIElementGetWindow(window, &windowID)
+            if windowID != 0 {
+                privateWindowIDs.insert(windowID)
+            }
+        }
+    }
+
+    return privateWindowIDs
 }
 
 /// JSONL output for a display source
@@ -191,8 +232,15 @@ struct SCKShot: AsyncParsableCommand {
 
         // 2. Add private/incognito browser windows (if enabled)
         if config.excludePrivateBrowsing {
+            // Safari: Use Accessibility API (window titles include "Private Browsing" there)
+            let safariPrivateIDs = getSafariPrivateWindowIDs()
+            let safariPrivateWindows = content.windows.filter { window in
+                safariPrivateIDs.contains(CGWindowID(window.windowID))
+            }
+            windowsToExclude.append(contentsOf: safariPrivateWindows)
+
+            // Chrome/Firefox: Use title-based detection (they include it in standard title)
             let privatePatterns: [(bundleID: String, patterns: [String])] = [
-                ("com.apple.Safari", ["(Private)", "Private Browsing"]),
                 ("com.google.Chrome", ["(Incognito)"]),
                 ("org.mozilla.firefox", ["(Private Browsing)", "Private Browsing"])
             ]
